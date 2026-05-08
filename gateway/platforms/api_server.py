@@ -1239,6 +1239,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1356,6 +1357,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -2211,6 +2213,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_reasoning_delta(delta):
+                if delta:
+                    _stream_q.put(("__reasoning_delta__", delta))
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -2239,6 +2245,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
+                    "args": function_args or {},
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }))
@@ -2255,6 +2262,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.discard(tool_call_id)
                 _stream_q.put(("__tool_progress__", {
                     "tool": function_name,
+                    "args": function_args or {},
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }))
@@ -2276,6 +2284,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                reasoning_callback=_on_reasoning_delta,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
@@ -2461,6 +2470,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning_delta__":
+                    reasoning_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": item[1]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode())
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -4028,6 +4050,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
@@ -4065,6 +4088,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=tool_progress_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
+                    reasoning_callback=reasoning_callback,
                     gateway_session_key=gateway_session_key,
                     route=route,
                 )
