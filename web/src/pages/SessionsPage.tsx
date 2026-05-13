@@ -131,6 +131,134 @@ function ToolCallBlock({
   );
 }
 
+function messageContentToText(content: SessionMessage["content"]): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content);
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+
+      const type = part.type;
+      if (type === "text" || type === "input_text" || type === "output_text") {
+        return part.text ?? "";
+      }
+
+      if (type === "image_url" || type === "input_image") {
+        const imageUrl =
+          typeof part.image_url === "string"
+            ? part.image_url
+            : part.image_url?.url;
+        return imageUrl ? `[image: ${imageUrl}]` : "[image]";
+      }
+
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function MultimodalContent({
+  content,
+  highlightTerms,
+  system,
+}: {
+  content: SessionMessage["content"];
+  highlightTerms?: string[];
+  system?: boolean;
+}) {
+  if (!content) return null;
+
+  if (typeof content === "string") {
+    return system ? (
+      <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
+        {content}
+      </div>
+    ) : (
+      <Markdown content={content} highlightTerms={highlightTerms} />
+    );
+  }
+
+  if (!Array.isArray(content)) {
+    return (
+      <Markdown
+        content={String(content)}
+        highlightTerms={highlightTerms}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {content.map((part, index) => {
+        if (typeof part === "string") {
+          return (
+            <Markdown
+              key={index}
+              content={part}
+              highlightTerms={highlightTerms}
+            />
+          );
+        }
+
+        if (!part || typeof part !== "object") return null;
+
+        const type = part.type;
+        if (type === "text" || type === "input_text" || type === "output_text") {
+          return (
+            <Markdown
+              key={index}
+              content={part.text ?? ""}
+              highlightTerms={highlightTerms}
+            />
+          );
+        }
+
+        if (type === "image_url" || type === "input_image") {
+          const imageUrl =
+            typeof part.image_url === "string"
+              ? part.image_url
+              : part.image_url?.url;
+          if (!imageUrl) return null;
+
+          return (
+            <div
+              key={index}
+              className="overflow-hidden border border-border bg-background"
+            >
+              <img
+                src={imageUrl}
+                alt="Session image attachment"
+                className="max-h-80 max-w-full object-contain"
+                loading="lazy"
+              />
+              <a
+                href={imageUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="block border-t border-border px-2 py-1 text-xs text-muted-foreground hover:text-foreground break-all"
+              >
+                {imageUrl}
+              </a>
+            </div>
+          );
+        }
+
+        return (
+          <pre
+            key={index}
+            className="text-xs text-muted-foreground whitespace-pre-wrap overflow-x-auto"
+          >
+            {JSON.stringify(part, null, 2)}
+          </pre>
+        );
+      })}
+    </div>
+  );
+}
+
 function MessageBubble({
   msg,
   highlight,
@@ -174,7 +302,7 @@ function MessageBubble({
   // Check if any search term appears as a prefix of any word in content
   const isHit = (() => {
     if (!highlight || !msg.content) return false;
-    const content = msg.content.toLowerCase();
+    const content = messageContentToText(msg.content).toLowerCase();
     const terms = highlight.toLowerCase().split(/\s+/).filter(Boolean);
     return terms.some((term) => content.includes(term));
   })();
@@ -201,14 +329,11 @@ function MessageBubble({
           </span>
         )}
       </div>
-      {msg.content &&
-        (msg.role === "system" ? (
-          <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">
-            {msg.content}
-          </div>
-        ) : (
-          <Markdown content={msg.content} highlightTerms={highlightTerms} />
-        ))}
+      <MultimodalContent
+        content={msg.content}
+        highlightTerms={highlightTerms}
+        system={msg.role === "system"}
+      />
       {msg.tool_calls && msg.tool_calls.length > 0 && (
         <div className="mt-1">
           {msg.tool_calls.map((tc) => (
