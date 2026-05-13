@@ -1922,7 +1922,17 @@ export interface WhatsAppOnboardingApplyResponse {
 
 export interface SessionMessage {
   role: "user" | "assistant" | "system" | "tool";
-  content: string | null;
+  content:
+    | string
+    | null
+    | Array<
+        | string
+        | {
+            type?: string;
+            text?: string;
+            image_url?: string | { url?: string; detail?: string };
+          }
+      >;
   tool_calls?: Array<{
     id: string;
     function: { name: string; arguments: string };
