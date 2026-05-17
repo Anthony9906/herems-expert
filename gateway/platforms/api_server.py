@@ -2776,6 +2776,32 @@ class APIServerAdapter(BasePlatformAdapter):
             _eff_sid = getattr(agent, "session_id", session_id)
             if isinstance(_eff_sid, str) and _eff_sid:
                 result["session_id"] = _eff_sid
+
+            # Auto-generate Hermes' own session title after successful API-server
+            # turns.  This is intentionally server-side only: clients such as
+            # Open WebUI may maintain their own conversation titles, but Hermes
+            # Dashboard reads state.db and needs the Hermes session title there.
+            final_response = result.get("final_response", "") if result else ""
+            if final_response and result and not result.get("failed") and not result.get("partial") and not result.get("interrupted"):
+                try:
+                    from agent.title_generator import maybe_auto_title
+                    maybe_auto_title(
+                        self._ensure_session_db(),
+                        result.get("session_id") or session_id,
+                        user_message,
+                        final_response,
+                        result.get("messages", conversation_history),
+                        failure_callback=getattr(agent, "_emit_auxiliary_failure", None),
+                        main_runtime={
+                            "model": getattr(agent, "model", None),
+                            "provider": getattr(agent, "provider", None),
+                            "base_url": getattr(agent, "base_url", None),
+                            "api_key": getattr(agent, "api_key", None),
+                            "api_mode": getattr(agent, "api_mode", None),
+                        },
+                    )
+                except Exception:
+                    logger.debug("API server auto-title scheduling failed", exc_info=True)
             return result, usage
 
         return await loop.run_in_executor(None, _run)
