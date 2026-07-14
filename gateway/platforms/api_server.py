@@ -1496,6 +1496,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                "run_tool_arguments": True,
+                "run_tool_results": True,
                 "approval_events": True,
                 "session_resources": True,
                 "session_chat": True,
@@ -4204,6 +4206,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "args": args or {},
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -4213,6 +4216,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "result": kwargs.get("result"),
                 })
             elif event_type == "reasoning.available":
                 _push({

@@ -305,6 +305,55 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_tool_events_include_arguments_and_results(self, adapter):
+        """Runs preserve rich MCP payloads required by Open WebUI AG-UI."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def _create_agent(**kwargs):
+                mock_agent = MagicMock()
+
+                def _run_conversation(**_run_kwargs):
+                    callback = kwargs["tool_progress_callback"]
+                    args = {
+                        "title": "Pick one",
+                        "message": "Choose",
+                        "options": ["A", "B"],
+                    }
+                    callback(
+                        "tool.started",
+                        "agui_bridge_mcp.ask_interactive_choice",
+                        "Choose",
+                        args,
+                    )
+                    callback(
+                        "tool.completed",
+                        "agui_bridge_mcp.ask_interactive_choice",
+                        None,
+                        None,
+                        duration=0.1,
+                        is_error=False,
+                        result={"kind": "choice", **args},
+                    )
+                    return {"final_response": ""}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                return mock_agent
+
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "ask me"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert '"event": "tool.started"' in body
+        assert '"options": ["A", "B"]' in body
+        assert '"event": "tool.completed"' in body
+        assert '"kind": "choice"' in body
+
 
 
     @pytest.mark.asyncio
