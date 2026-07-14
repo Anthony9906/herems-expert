@@ -354,6 +354,41 @@ class TestRunEvents:
         assert '"event": "tool.completed"' in body
         assert '"kind": "choice"' in body
 
+    @pytest.mark.asyncio
+    async def test_reasoning_uses_dedicated_delta_not_assistant_fallback(self, adapter):
+        """Runs must not duplicate final assistant content as reasoning."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def _create_agent(**kwargs):
+                mock_agent = MagicMock()
+
+                def _run_conversation(**_run_kwargs):
+                    kwargs["reasoning_callback"]("Inspect the target before answering.")
+                    kwargs["stream_delta_callback"]("The target is safe.")
+                    kwargs["tool_progress_callback"](
+                        "reasoning.available",
+                        "_thinking",
+                        "The target is safe.",
+                        None,
+                    )
+                    return {"final_response": "The target is safe."}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                return mock_agent
+
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "inspect"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert '"event": "reasoning.delta"' in body
+        assert '"delta": "Inspect the target before answering."' in body
+        assert '"event": "reasoning.available"' not in body
+
 
 
     @pytest.mark.asyncio
