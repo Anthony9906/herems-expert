@@ -972,6 +972,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_tool_arguments": True,
                 "run_tool_results": True,
                 "approval_events": True,
+                "run_reasoning_deltas": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
@@ -2868,13 +2869,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": kwargs.get("is_error", False),
                     "result": kwargs.get("result"),
                 })
-            elif event_type == "reasoning.available":
-                _push({
-                    "event": "reasoning.available",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "text": preview or "",
-                })
+            # ``reasoning.available`` is a legacy tool-progress fallback whose
+            # preview is assistant content, not model reasoning. Runs expose
+            # real reasoning through the dedicated callback below instead.
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
@@ -2984,6 +2981,19 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        def _reasoning_cb(delta: Optional[str]) -> None:
+            if not delta:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "reasoning.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": delta,
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -3000,6 +3010,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    reasoning_callback=_reasoning_cb,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
