@@ -4226,6 +4226,66 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    @staticmethod
+    def _run_tool_result_preview(result: Any, max_serialized_chars: int = 48 * 1024) -> Any:
+        """Bound tool results placed on the Runs SSE transport.
+
+        Full tool results are persisted in the session database by the agent.  The
+        Runs stream only needs a display preview and must not emit an unbounded
+        single SSE line (aiohttp readers commonly cap one line at 128 KiB).
+        """
+        try:
+            serialized = json.dumps(result, ensure_ascii=True, default=str)
+        except Exception:
+            serialized = json.dumps(str(result), ensure_ascii=True)
+        if len(serialized) <= max_serialized_chars:
+            return result
+
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        return {
+            "truncated": True,
+            "original_size": len(serialized),
+            "preview": text[:8000],
+        }
+
+    def _make_run_tool_callbacks(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return exact-ID tool lifecycle callbacks for the Runs SSE queue."""
+        def _push(event: Dict[str, Any]) -> None:
+            self._set_run_status(run_id, "running", last_event=event.get("event"))
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                try:
+                    loop.call_soon_threadsafe(q.put_nowait, event)
+                except Exception:
+                    pass
+
+        def _started(tool_call_id, function_name, function_args):
+            from agent.display import build_tool_preview
+
+            args = function_args or {}
+            _push({
+                "event": "tool.started",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "tool_call_id": tool_call_id,
+                "tool": function_name,
+                "preview": build_tool_preview(function_name, args) or function_name,
+                "args": args,
+            })
+
+        def _completed(tool_call_id, function_name, function_args, function_result):
+            _push({
+                "event": "tool.completed",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "tool_call_id": tool_call_id,
+                "tool": function_name,
+                "args": function_args or {},
+                "result": self._run_tool_result_preview(function_result),
+            })
+
+        return _started, _completed
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
@@ -4319,7 +4379,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -4366,7 +4426,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
+                    tool_start_callback=tool_start_cb,
+                    tool_complete_callback=tool_complete_cb,
                     reasoning_callback=_reasoning_cb,
                     gateway_session_key=gateway_session_key,
                     route=route,
@@ -4387,7 +4448,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": ["once", "session", "always", "deny"],
+                        "choices": ["once", "session", "deny"],
                     })
                     self._set_run_status(
                         run_id,
@@ -4638,11 +4699,11 @@ class APIServerAdapter(BasePlatformAdapter):
         raw_choice = str(body.get("choice", "")).strip().lower()
         aliases = {"approve": "once", "approved": "once", "allow": "once"}
         choice = aliases.get(raw_choice, raw_choice)
-        allowed = {"once", "session", "always", "deny"}
+        allowed = {"once", "session", "deny"}
         if choice not in allowed:
             return web.json_response(
                 _openai_error(
-                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    "Invalid approval choice; expected one of: once, session, deny",
                     code="invalid_approval_choice",
                 ),
                 status=400,

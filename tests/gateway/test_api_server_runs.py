@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -314,26 +315,23 @@ class TestRunEvents:
                 mock_agent = MagicMock()
 
                 def _run_conversation(**_run_kwargs):
-                    callback = kwargs["tool_progress_callback"]
+                    start_callback = kwargs["tool_start_callback"]
+                    complete_callback = kwargs["tool_complete_callback"]
                     args = {
                         "title": "Pick one",
                         "message": "Choose",
                         "options": ["A", "B"],
                     }
-                    callback(
-                        "tool.started",
+                    start_callback(
+                        "call_choice_1",
                         "agui_bridge_mcp.ask_interactive_choice",
-                        "Choose",
                         args,
                     )
-                    callback(
-                        "tool.completed",
+                    complete_callback(
+                        "call_choice_1",
                         "agui_bridge_mcp.ask_interactive_choice",
-                        None,
-                        None,
-                        duration=0.1,
-                        is_error=False,
-                        result={"kind": "choice", **args},
+                        args,
+                        {"kind": "choice", **args},
                     )
                     return {"final_response": ""}
 
@@ -350,9 +348,50 @@ class TestRunEvents:
                 body = await events_resp.text()
 
         assert '"event": "tool.started"' in body
+        assert '"tool_call_id": "call_choice_1"' in body
         assert '"options": ["A", "B"]' in body
         assert '"event": "tool.completed"' in body
         assert '"kind": "choice"' in body
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_name_tools_keep_distinct_ids_and_arguments(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def _create_agent(**kwargs):
+                mock_agent = MagicMock()
+
+                def _run_conversation(**_run_kwargs):
+                    start = kwargs["tool_start_callback"]
+                    complete = kwargs["tool_complete_callback"]
+                    start("call_search_a", "web_search", {"query": "alpha"})
+                    start("call_search_b", "web_search", {"query": "beta"})
+                    complete("call_search_b", "web_search", {"query": "beta"}, {"ok": "beta"})
+                    complete("call_search_a", "web_search", {"query": "alpha"}, {"ok": "alpha"})
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                return mock_agent
+
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "search"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert body.count('"tool_call_id": "call_search_a"') == 2
+        assert body.count('"tool_call_id": "call_search_b"') == 2
+        assert body.count('"query": "alpha"') == 2
+        assert body.count('"query": "beta"') == 2
+
+    def test_large_tool_results_are_bounded_for_sse(self, adapter):
+        result = adapter._run_tool_result_preview("x" * 200_000)
+
+        assert result["truncated"] is True
+        assert result["original_size"] > 128 * 1024
+        assert len(json.dumps(result)) < 64 * 1024
 
     @pytest.mark.asyncio
     async def test_reasoning_uses_dedicated_delta_not_assistant_fallback(self, adapter):
@@ -487,14 +526,14 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={"choice": "session", "resolve_all": True},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
                 assert approval_data["resolved"] == 1
-                assert attacker_entry.result == "always"
+                assert attacker_entry.result == "session"
                 assert attacker_entry.event.is_set()
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()
@@ -510,6 +549,24 @@ class TestRunEvents:
                 victim_interrupted.set()
                 attacker_interrupted.set()
 
+    @pytest.mark.asyncio
+    async def test_permanent_approval_is_rejected(self, adapter):
+        """Runs clients must never be able to persist a permanent allow rule."""
+        app = _create_runs_app(adapter)
+        run_id = "run_reject_always"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval"}
+        adapter._run_approval_sessions[run_id] = "session-123"
+
+        async with TestClient(TestServer(app)) as cli:
+            approval_resp = await cli.post(
+                f"/v1/runs/{run_id}/approval",
+                json={"choice": "always"},
+            )
+
+            approval_data = await approval_resp.json()
+
+        assert approval_resp.status == 400
+        assert approval_data["error"]["code"] == "invalid_approval_choice"
 
     @pytest.mark.asyncio
     async def test_events_not_found_returns_404(self, adapter):
