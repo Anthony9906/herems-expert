@@ -4365,6 +4365,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+
+        # A stable session_id is also the server-side history key. Clients
+        # such as Open WebUI intentionally submit only the current turn and
+        # rely on Hermes to own conversation state. Match the session chat
+        # endpoints by hydrating persisted history when the caller did not
+        # explicitly choose another history source.
+        if (
+            body.get("session_id")
+            and raw_history is None
+            and not previous_response_id
+            and not (isinstance(raw_input, list) and len(raw_input) > 1)
+        ):
+            conversation_history = self._conversation_history_for_session(session_id)
+
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
