@@ -810,6 +810,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return persisted messages in the format expected by the agent loop."""
+        db = self._ensure_session_db()
+        if db is None:
+            return []
+        try:
+            return db.get_messages_as_conversation(session_id)
+        except Exception as exc:
+            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            return []
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -3016,6 +3027,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
+
+        # A stable session_id is also the server-side history key.  Clients
+        # such as Open WebUI intentionally submit only the current turn and
+        # rely on Hermes to own conversation state.  Match the session chat
+        # endpoints by hydrating persisted history when the caller did not
+        # explicitly choose another history source.
+        if (
+            body.get("session_id")
+            and raw_history is None
+            and not previous_response_id
+            and not (isinstance(raw_input, list) and len(raw_input) > 1)
+        ):
+            conversation_history = self._conversation_history_for_session(session_id)
+
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()

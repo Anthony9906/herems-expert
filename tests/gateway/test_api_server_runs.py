@@ -192,6 +192,92 @@ class TestStartRun:
                 )
                 assert resp.status == 202
 
+    @pytest.mark.asyncio
+    async def test_explicit_session_id_loads_persisted_history(self, adapter):
+        app = _create_runs_app(adapter)
+        persisted_history = [
+            {"role": "user", "content": "Tell me about Leicester City in 2016"},
+            {"role": "assistant", "content": "They won the Premier League."},
+        ]
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    return_value=persisted_history,
+                ) as mock_load_history,
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "Show me that season's table", "session_id": "chat-123"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "completed"
+                mock_load_history.assert_called_once_with("chat-123")
+                mock_agent.run_conversation.assert_called_once_with(
+                    user_message="Show me that season's table",
+                    conversation_history=persisted_history,
+                    task_id="chat-123",
+                )
+
+    @pytest.mark.asyncio
+    async def test_explicit_history_overrides_persisted_session_history(self, adapter):
+        app = _create_runs_app(adapter)
+        explicit_history = [{"role": "user", "content": "client-owned context"}]
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_conversation_history_for_session") as mock_load_history,
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "current turn",
+                        "session_id": "chat-123",
+                        "conversation_history": explicit_history,
+                    },
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "completed"
+                mock_load_history.assert_not_called()
+                assert (
+                    mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+                    == explicit_history
+                )
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
