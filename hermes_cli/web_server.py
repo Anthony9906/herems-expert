@@ -2778,6 +2778,9 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
 async def get_status(profile: Optional[str] = None):
     status_scope = None
     requested_profile = (profile or "").strip()
+    profile_scoped_status = bool(
+        requested_profile and requested_profile.lower() != "current"
+    )
     # Plain /api/status stays the machine-level public liveness probe. The
     # dashboard adds ?profile= when its management switcher targets another
     # profile, so its gateway badge reflects the selected profile.
@@ -2786,18 +2789,27 @@ async def get_status(profile: Optional[str] = None):
     # awaits the remote-health probe, and _profile_scope swaps process-global
     # skills-module attributes that a concurrent request would cross-restore
     # across that await. Status only resolves get_hermes_home() at call time
-    # (config/env/gateway state), which the task-local contextvar covers.
-    if requested_profile and requested_profile.lower() != "current":
+    # (config/env), which the task-local contextvar covers. Gateway identity
+    # helpers deliberately ignore context-local overrides, so their paths are
+    # resolved explicitly below for the selected profile.
+    if profile_scoped_status:
         status_scope = _config_profile_scope(requested_profile)
         status_scope.__enter__()
 
     try:
+        status_home = get_hermes_home()
         current_ver, latest_ver = check_config_version()
         # --- Gateway liveness detection ---
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = get_running_pid_cached()
+        if profile_scoped_status:
+            gateway_pid = get_running_pid_cached(
+                status_home / "gateway.pid",
+                cleanup_stale=False,
+            )
+        else:
+            gateway_pid = get_running_pid_cached()
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -2829,7 +2841,11 @@ async def get_status(profile: Optional[str] = None):
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        local_runtime = read_runtime_status()
+        local_runtime = (
+            read_runtime_status(status_home / "gateway_state.json")
+            if profile_scoped_status
+            else read_runtime_status()
+        )
         runtime = local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
@@ -2839,7 +2855,14 @@ async def get_status(profile: Optional[str] = None):
         # is display-only. (Running os.kill on a remote PID is both wrong and
         # trips the test live-system guard.)
         if not gateway_running and local_runtime is not None:
-            runtime_pid = get_runtime_status_running_pid(local_runtime)
+            runtime_pid = (
+                get_runtime_status_running_pid(
+                    local_runtime,
+                    expected_home=status_home,
+                )
+                if profile_scoped_status
+                else get_runtime_status_running_pid(local_runtime)
+            )
             if runtime_pid is not None:
                 gateway_running = True
                 gateway_pid = runtime_pid

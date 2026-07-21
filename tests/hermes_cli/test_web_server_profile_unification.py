@@ -6,6 +6,8 @@ profile switcher can target any profile's HERMES_HOME. These tests pin:
 reads/writes land in the REQUESTED profile, the dashboard's own profile
 stays untouched, and the chat PTY env is scoped via HERMES_HOME.
 """
+import json
+
 import pytest
 import yaml
 
@@ -476,10 +478,17 @@ class TestProfileScopedGateway:
         from hermes_constants import get_hermes_home
 
         seen_homes = []
+        seen_pid_paths = []
+        seen_runtime_paths = []
 
-        def fake_get_running_pid():
+        def fake_get_running_pid(pid_path, *, cleanup_stale=True):
             seen_homes.append(str(get_hermes_home()))
+            seen_pid_paths.append(pid_path)
             return None
+
+        def fake_read_runtime_status(path):
+            seen_runtime_paths.append(path)
+            return {"gateway_state": "startup_failed", "platforms": {}}
 
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
         # get_status probes via the TTL-cached wrapper (PR #53511 salvage);
@@ -488,7 +497,7 @@ class TestProfileScopedGateway:
         monkeypatch.setattr(
             web_server,
             "read_runtime_status",
-            lambda: {"gateway_state": "startup_failed", "platforms": {}},
+            fake_read_runtime_status,
         )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
 
@@ -496,6 +505,10 @@ class TestProfileScopedGateway:
 
         assert resp.status_code == 200
         assert seen_homes[0] == str(isolated_profiles["worker_beta"])
+        assert seen_pid_paths == [isolated_profiles["worker_beta"] / "gateway.pid"]
+        assert seen_runtime_paths == [
+            isolated_profiles["worker_beta"] / "gateway_state.json"
+        ]
         assert resp.json()["hermes_home"] == str(isolated_profiles["worker_beta"])
 
     def test_status_uses_runtime_pid_when_profile_pid_file_is_missing(
@@ -518,11 +531,30 @@ class TestProfileScopedGateway:
             "exit_reason": None,
             "updated_at": "2026-06-17T00:00:00+00:00",
         }
+        stale_default_runtime = {
+            "pid": 1111,
+            "gateway_state": "running",
+            "platforms": {"api_server": {"state": "disconnected"}},
+            "updated_at": "2026-04-25T00:00:00+00:00",
+        }
+        (worker_home / "gateway_state.json").write_text(
+            json.dumps(runtime), encoding="utf-8"
+        )
+        (isolated_profiles["default"] / "gateway_state.json").write_text(
+            json.dumps(stale_default_runtime), encoding="utf-8"
+        )
         monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
-        monkeypatch.setattr(web_server, "get_running_pid_cached", lambda: None)
-        monkeypatch.setattr(web_server, "read_runtime_status", lambda: runtime)
         monkeypatch.setattr(
-            web_server, "get_runtime_status_running_pid", lambda payload: 4242
+            web_server,
+            "get_running_pid_cached",
+            lambda _path, *, cleanup_stale=True: None,
+        )
+        monkeypatch.setattr(
+            web_server,
+            "get_runtime_status_running_pid",
+            lambda payload, *, expected_home=None: (
+                4242 if payload == runtime and expected_home == worker_home else None
+            ),
         )
         monkeypatch.setattr(web_server, "_GATEWAY_HEALTH_URL", None)
         from gateway.config import Platform
