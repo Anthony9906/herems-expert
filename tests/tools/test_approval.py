@@ -347,6 +347,26 @@ class TestSessionKeyContext:
         finally:
             approval_module.reset_current_session_key(token)
 
+    def test_approval_route_can_be_isolated_from_policy_session(self):
+        session_token = approval_module.set_current_session_key("chat-123")
+        route_token = approval_module.set_current_approval_route_key("run-456")
+        try:
+            assert approval_module.get_current_session_key() == "chat-123"
+            assert approval_module.get_current_approval_route_key() == "run-456"
+        finally:
+            approval_module.reset_current_approval_route_key(route_token)
+            approval_module.reset_current_session_key(session_token)
+
+    def test_approval_route_defaults_to_policy_session(self):
+        session_token = approval_module.set_current_session_key("legacy-session")
+        try:
+            assert (
+                approval_module.get_current_approval_route_key()
+                == "legacy-session"
+            )
+        finally:
+            approval_module.reset_current_session_key(session_token)
+
     def test_gateway_runner_binds_session_key_to_context_before_agent_run(self):
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))

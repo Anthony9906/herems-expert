@@ -652,6 +652,126 @@ class TestRunEvents:
                 attacker_interrupted.set()
 
     @pytest.mark.asyncio
+    async def test_session_approval_persists_across_runs_in_same_conversation(
+        self, adapter, monkeypatch
+    ):
+        """A session choice survives a new run without sharing run queues."""
+        app = _create_runs_app(adapter)
+        pattern_key = "cross-run-session-approval"
+        chat_id = "chat-session-approval"
+        other_chat_id = "chat-session-approval-other"
+        policy_key = f"api:default:{chat_id}"
+        other_policy_key = f"api:default:{other_chat_id}"
+
+        monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
+
+        def _make_approval_agent():
+            mock_agent = MagicMock()
+
+            def _run(user_message=None, conversation_history=None, task_id=None):
+                result = approval_mod._run_approval_gate(
+                    pattern_key=pattern_key,
+                    description="cross-run session approval test",
+                    display_target="synthetic approval target",
+                    cron_deny_message="cron denied",
+                    autoapprove_log_prefix="test approval",
+                )
+                return {
+                    "final_response": (
+                        "approved" if result["approved"] else "blocked"
+                    )
+                }
+
+            mock_agent.run_conversation.side_effect = _run
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async def _wait_for_pending(run_id):
+            for _ in range(100):
+                with approval_mod._lock:
+                    if approval_mod._gateway_queues.get(run_id):
+                        return
+                await asyncio.sleep(0.02)
+            pytest.fail(f"run {run_id} did not request approval")
+
+        approval_mod.clear_session(policy_key)
+        approval_mod.clear_session(other_policy_key)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    adapter,
+                    "_create_agent",
+                    side_effect=[
+                        _make_approval_agent(),
+                        _make_approval_agent(),
+                        _make_approval_agent(),
+                    ],
+                ):
+                    first_resp = await cli.post(
+                        "/v1/runs",
+                        json={"input": "first", "session_id": chat_id},
+                    )
+                    assert first_resp.status == 202
+                    first_run = (await first_resp.json())["run_id"]
+                    await _wait_for_pending(first_run)
+
+                    first_approval = await cli.post(
+                        f"/v1/runs/{first_run}/approval",
+                        json={"choice": "session"},
+                    )
+                    assert first_approval.status == 200
+                    first_events = await cli.get(
+                        f"/v1/runs/{first_run}/events"
+                    )
+                    first_body = await first_events.text()
+                    assert '"event": "approval.request"' in first_body
+                    assert '"event": "run.completed"' in first_body
+                    assert approval_mod.is_approved(policy_key, pattern_key)
+
+                    second_resp = await cli.post(
+                        "/v1/runs",
+                        json={"input": "second", "session_id": chat_id},
+                    )
+                    assert second_resp.status == 202
+                    second_run = (await second_resp.json())["run_id"]
+                    assert second_run != first_run
+                    second_events = await cli.get(
+                        f"/v1/runs/{second_run}/events"
+                    )
+                    second_body = await second_events.text()
+                    assert '"event": "run.completed"' in second_body
+                    assert '"event": "approval.request"' not in second_body
+
+                    other_resp = await cli.post(
+                        "/v1/runs",
+                        json={"input": "other", "session_id": other_chat_id},
+                    )
+                    assert other_resp.status == 202
+                    other_run = (await other_resp.json())["run_id"]
+                    await _wait_for_pending(other_run)
+                    assert not approval_mod.is_approved(
+                        other_policy_key, pattern_key
+                    )
+
+                    other_denial = await cli.post(
+                        f"/v1/runs/{other_run}/approval",
+                        json={"choice": "deny"},
+                    )
+                    assert other_denial.status == 200
+                    other_events = await cli.get(
+                        f"/v1/runs/{other_run}/events"
+                    )
+                    assert (
+                        '"event": "run.completed"'
+                        in await other_events.text()
+                    )
+        finally:
+            approval_mod.clear_session(policy_key)
+            approval_mod.clear_session(other_policy_key)
+
+    @pytest.mark.asyncio
     async def test_events_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

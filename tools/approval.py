@@ -42,6 +42,10 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_route_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_route_key",
+    default="",
+)
 _approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_turn_id",
     default="",
@@ -178,6 +182,22 @@ def reset_current_session_key(token: contextvars.Token[str]) -> None:
     _approval_session_key.reset(token)
 
 
+def set_current_approval_route_key(route_key: str) -> contextvars.Token[str]:
+    """Bind the transport route for the active approval request.
+
+    The route key identifies the queue/callback that can resolve a blocking
+    approval.  It is intentionally separate from the policy session key:
+    concurrent API runs need isolated queues while turns in the same
+    conversation share session-scoped allow decisions.
+    """
+    return _approval_route_key.set(route_key or "")
+
+
+def reset_current_approval_route_key(token: contextvars.Token[str]) -> None:
+    """Restore the prior approval transport route."""
+    _approval_route_key.reset(token)
+
+
 def set_current_observability_context(
     *,
     turn_id: str = "",
@@ -212,6 +232,18 @@ def get_current_session_key(default: str = "default") -> str:
         return session_key
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
+
+
+def get_current_approval_route_key(default: str = "default") -> str:
+    """Return the queue/callback route for the active approval request.
+
+    Legacy gateway paths use one key for routing and policy, so an unset route
+    falls back to :func:`get_current_session_key`.
+    """
+    route_key = _approval_route_key.get()
+    if route_key:
+        return route_key
+    return get_current_session_key(default=default)
 
 
 def _get_session_platform() -> str:
@@ -2693,6 +2725,7 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    route_key = get_current_approval_route_key(default=session_key)
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -2753,7 +2786,7 @@ def _run_approval_gate(
         # approved/BLOCKED outcome.
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(route_key)
 
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
@@ -2765,7 +2798,7 @@ def _run_approval_gate(
                 "allow_permanent": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                route_key, notify_cb, approval_data, surface="gateway"
             )
             if decision.get("notify_failed"):
                 return {
@@ -2811,7 +2844,7 @@ def _run_approval_gate(
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
-        submit_pending(session_key, {
+        submit_pending(route_key, {
             "command": display_target,
             "pattern_key": pattern_key,
             "description": description,
@@ -3352,6 +3385,7 @@ def check_all_command_guards(command: str, env_type: str,
     warnings = []  # list of (pattern_key, description, is_tirith)
 
     session_key = get_current_session_key()
+    route_key = get_current_approval_route_key(default=session_key)
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -3425,7 +3459,7 @@ def check_all_command_guards(command: str, env_type: str,
     if is_gateway or is_ask:
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(route_key)
 
         if notify_cb is not None:
             # --- Blocking gateway approval (queue-based) ---
@@ -3452,7 +3486,7 @@ def check_all_command_guards(command: str, env_type: str,
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                route_key, notify_cb, approval_data, surface="gateway"
             )
             if decision.get("notify_failed"):
                 return {
@@ -3533,7 +3567,7 @@ def check_all_command_guards(command: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
+        submit_pending(route_key, pending_data)
         result = {
             "approved": False,
             "pattern_key": primary_key,
@@ -3684,6 +3718,7 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    route_key = get_current_approval_route_key(default=session_key)
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
@@ -3743,7 +3778,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     notify_cb = None
     with _lock:
-        notify_cb = _gateway_notify_cbs.get(session_key)
+        notify_cb = _gateway_notify_cbs.get(route_key)
 
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
@@ -3756,7 +3791,7 @@ def check_execute_code_guard(code: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
+        submit_pending(route_key, pending_data)
         result = {
             "approved": False,
             "pattern_key": pattern_key,
@@ -3783,7 +3818,7 @@ def check_execute_code_guard(code: str, env_type: str,
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
     decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+        route_key, notify_cb, approval_data, surface="gateway"
     )
     if decision.get("notify_failed"):
         return {
@@ -3864,13 +3899,14 @@ def request_elicitation_consent(
     """
     try:
         session_key = get_current_session_key()
+        route_key = get_current_approval_route_key(default=session_key)
     except Exception as exc:  # pragma: no cover -- defensive
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"
 
     if _is_gateway_approval_context():
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(route_key)
         if notify_cb is None:
             logger.warning(
                 "Elicitation requested in gateway session %s but no "
@@ -3887,7 +3923,7 @@ def request_elicitation_consent(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                route_key, notify_cb, approval_data, surface=surface,
             )
         except Exception as exc:
             logger.error(

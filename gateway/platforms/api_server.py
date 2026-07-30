@@ -4987,11 +4987,15 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history = await self._conversation_history_for_session(session_id)
 
         # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
+        # per API run.  Session-scoped allow decisions, however, belong to the
+        # stable conversation so "approve for this session" survives the next
+        # user turn. Keep the transport route and policy scope separate:
+        # resolving one run must never unblock another run's pending command.
+        request_profile = _api_request_profile.get()
         approval_session_key = run_id
+        approval_policy_session_key = (
+            f"api:{request_profile or 'default'}:{session_id}"
+        )
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
@@ -5052,8 +5056,6 @@ class APIServerAdapter(BasePlatformAdapter):
         route = self._resolve_route(body.get("model"))
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
-
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
@@ -5115,20 +5117,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
+                        reset_current_approval_route_key,
                         reset_current_session_key,
+                        set_current_approval_route_key,
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    approval_route_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
                             # environment state.
-                            approval_token = set_current_session_key(approval_session_key)
+                            approval_token = set_current_session_key(
+                                approval_policy_session_key
+                            )
+                            approval_route_token = set_current_approval_route_key(
+                                approval_session_key
+                            )
                             session_tokens = self._bind_api_server_session(
                                 session_key=approval_session_key,
                             )
@@ -5145,6 +5155,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 if approval_token is not None:
                                     try:
                                         reset_current_session_key(approval_token)
+                                    except Exception:
+                                        pass
+                                if approval_route_token is not None:
+                                    try:
+                                        reset_current_approval_route_key(
+                                            approval_route_token
+                                        )
                                     except Exception:
                                         pass
                                 if session_tokens:
